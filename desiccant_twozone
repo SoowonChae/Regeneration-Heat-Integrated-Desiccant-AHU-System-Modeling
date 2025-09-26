@@ -1,0 +1,305 @@
+# desiccant_twozone.py
+# Two-zone (Adsorption / Regeneration) desiccant wheel model — model-only, no execution loop.
+# You call adsorption_pass(...) or regeneration_pass(...) with your inlet air and current solid state.
+# The functions return outlet air (T_out, W_out) and updated desiccant fields (Ts_new, X_new).
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Tuple, Optional, Dict
+import math
+import numpy as np
+
+# -----------------------------
+# Psychrometrics (robust)
+# -----------------------------
+
+def p_ws_pa(T_C: float) -> float:
+    """Saturation vapor pressure [Pa] (Magnus), temperature clamped for stability."""
+    T_C = max(-50.0, min(100.0, T_C))
+    return 610.94 * math.exp(17.625 * T_C / (T_C + 243.04))
+
+def W_from_T_aw(T_C: float, aw: float, P_pa: float = 101325.0) -> float:
+    """Humidity ratio from temperature and water activity (aw ≈ RH at surface)."""
+    aw = max(1e-6, min(0.98, aw))
+    pw = aw * p_ws_pa(T_C)
+    return 0.62198 * pw / (P_pa - pw)
+
+def RH_from_T_W(T_C: float, W: float, P_pa: float = 101325.0) -> float:
+    pw = (W * P_pa) / (0.62198 + W)
+    return pw / p_ws_pa(T_C)
+
+def h_kJkg(T_C: float, W: float) -> float:
+    """Moist-air enthalpy per kg dry air [kJ/kg_da]."""
+    return 1.006 * T_C + W * (2501.0 + 1.86 * T_C)
+
+def rho_dry_per_m3(T_C: float, W: float, P_pa: float = 101325.0) -> float:
+    """kg of dry air per m^3 of moist air (dry-air basis density proxy)."""
+    pv = (W * P_pa) / (0.62198 + W)
+    return (P_pa - pv) / (287.055 * (T_C + 273.15))
+
+def cpm_kJkgK(W: float) -> float:
+    """Approx moist-air sensible specific heat [kJ/kg_da/K]."""
+    return 1.006 + 1.86 * W
+
+# -----------------------------
+# GAB isotherm (Silica gel default) + inverse
+# -----------------------------
+
+@dataclass
+class GABParams:
+    Xm: float = 0.35    # monolayer capacity [kg/kg_dry]
+    C25: float = 10.0
+    K25: float = 0.80
+    cC: float = 0.0     # d ln(C)/dT [1/K]
+    cK: float = 0.0     # d ln(K)/dT [1/K]
+
+def _gab_CK_at_T(T_C: float, p: GABParams) -> Tuple[float, float]:
+    C = p.C25 * math.exp(p.cC * (T_C - 25.0))
+    K = p.K25 * math.exp(p.cK * (T_C - 25.0))
+    return C, K
+
+def Xeq_GAB(T_C: float, aw: float, p: GABParams) -> float:
+    C, K = _gab_CK_at_T(T_C, p)
+    denom = (1.0 - K * aw) * (1.0 - K * aw + C * K * aw)
+    if denom <= 0.0:
+        denom = 1e-9
+    X = p.Xm * C * K * aw / denom
+    return max(0.0, X)
+
+def invert_aw_from_X(T_C: float, X_target: float, p: GABParams,
+                     lo: float = 1e-6, hi: float = 0.95, iters: int = 60) -> float:
+    """Bisection for aw such that Xeq_GAB(T, aw) ≈ X_target."""
+    lo = max(1e-9, lo); hi = min(0.999, hi)
+    f_lo = Xeq_GAB(T_C, lo, p) - X_target
+    f_hi = Xeq_GAB(T_C, hi, p) - X_target
+    if f_lo > 0: return lo
+    if f_hi < 0: return hi
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        f_mid = Xeq_GAB(T_C, mid, p) - X_target
+        if abs(f_mid) < 1e-10: return mid
+        if f_mid > 0: hi = mid
+        else: lo = mid
+    return 0.5 * (lo + hi)
+
+# -----------------------------
+# Geometry / materials / air
+# -----------------------------
+
+@dataclass
+class Geometry:
+    L: float = 0.20       # flow length [m]
+    dh: float = 0.002     # hydraulic diameter [m]
+    eps: float = 0.80     # porosity [-]
+    a_s: float = 2000.0   # specific surface area [m^2/m^3]
+
+@dataclass
+class SorbentProps:
+    rho_s: float = 250.0  # bulk dry density [kg/m^3]
+    cp_s: float = 0.92    # kJ/kg/K
+    H_ads: float = 2800.0 # kJ/kg_water (exothermic; use with minus sign in energy balance)
+
+@dataclass
+class AirProps:
+    k: float = 0.026      # W/m/K (for correlations if needed)
+    mu: float = 1.9e-5    # Pa·s
+    Dv: float = 2.5e-5    # m^2/s
+    P: float = 101325.0   # Pa
+
+# -----------------------------
+# (Optional) transfer from face velocity
+# -----------------------------
+
+def transfer_from_vface(geom: Geometry, air: AirProps, v_face: float,
+                        T_ref_C: float = 35.0, W_ref: float = 0.012) -> Tuple[float, float, float]:
+    """Return (h [W/m2K], k_g [m/s], Re) using entrance-region laminar correlations."""
+    u = max(1e-9, v_face / max(1e-6, geom.eps))  # interstitial velocity
+    rho = rho_dry_per_m3(T_ref_C, W_ref, air.P)
+    Re  = rho * u * geom.dh / air.mu
+    Pr  = air.mu * 1006.0 / air.k
+    Sc  = air.mu / (rho * air.Dv)
+    Nu  = 1.86 * ((Re * Pr * geom.dh / geom.L) ** (1.0 / 3.0))
+    Sh  = 1.86 * ((Re * Sc * geom.dh / geom.L) ** (1.0 / 3.0))
+    h_Wm2K  = Nu * air.k / geom.dh
+    kg_mps  = Sh * air.Dv / geom.dh
+    return h_Wm2K, kg_mps, Re
+
+# -----------------------------
+# I/O contracts (one-zone pass)
+# -----------------------------
+
+@dataclass
+class ZoneInputs:
+    """Inputs for ONE pass (adsorption or regeneration)."""
+    geom: Geometry
+    sorb: SorbentProps
+    air:  AirProps
+    gab:  GABParams
+
+    # Transport coefficients
+    h_Wm2K: float
+    kg_mps: float
+
+    # Discretization
+    dx_m: float          # axial step [m] => Nx = len(Ts)-1
+    dt_s: float          # dwell time in this zone for this pass [s]
+
+    # Inlet air + flux (dry-air basis)
+    T_in_C: float
+    W_in:   float
+    mdot_dry_kgps: float
+    face_area_m2:  float  # to compute mass flux G = mdot/A
+
+@dataclass
+class ZoneState:
+    """Current desiccant profiles (axial, Nx+1)."""
+    Ts_C: np.ndarray
+    X:    np.ndarray
+
+@dataclass
+class ZoneOutputs:
+    """Outlet air + updated solid + helpful profiles."""
+    T_out_C: float
+    W_out:   float
+    Ts_C_new: np.ndarray
+    X_new:    np.ndarray
+    Tg_C: np.ndarray
+    Wg:   np.ndarray
+    Wstar: np.ndarray
+    a_w:   np.ndarray
+    metrics: Dict[str, float]
+
+# -----------------------------
+# Core kernels
+# -----------------------------
+
+def surface_Wstar(Ts_C: float, X: float, gab: GABParams, P_pa: float) -> Tuple[float, float]:
+    """Return (W*, a_w) from current (Ts, X)."""
+    aw_s = invert_aw_from_X(Ts_C, X, gab)
+    return W_from_T_aw(Ts_C, aw_s, P_pa), aw_s
+
+def gas_rhs_x(Tg_C: float, Wg: float, Ts_C: float, Wstar: float,
+              G_kgpsm2: float, a_s_m2pm3: float, h_Wm2K: float, kg_mps: float,
+              H_ads_kJpkg: float, P_pa: float) -> Tuple[float, float]:
+    """(dTg/dx [K/m], dWg/dx [/m]) at a point."""
+    cpm   = cpm_kJkgK(Wg)       # kJ/kg/K
+    h_kJ  = h_Wm2K / 1000.0     # kJ/s/m2/K
+    dWdx  = (a_s_m2pm3 * kg_mps / max(1e-12, G_kgpsm2)) * (Wstar - Wg)
+    dTdx  = (a_s_m2pm3 / (max(1e-12, G_kgpsm2) * cpm)) * (h_kJ * (Ts_C - Tg_C) + (-H_ads_kJpkg) * kg_mps * (Wstar - Wg))
+    return dTdx, dWdx
+
+def gas_march_along_x(T_in: float, W_in: float, Ts: np.ndarray, X: np.ndarray,
+                      G: float, a_s: float, h: float, kg: float,
+                      Hads: float, P_pa: float, gab: GABParams, dx: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    March gas from x=0..L using current solid fields (Ts, X).
+    Returns (Tg(x), Wg(x), Wstar(x), a_w(x)).
+    """
+    Nx = Ts.size - 1
+    Tg = np.empty(Nx + 1); Wg = np.empty(Nx + 1)
+    Wstar = np.empty(Nx + 1); a_w = np.empty(Nx + 1)
+    Tg[0] = T_in; Wg[0] = W_in
+
+    # Precompute Wstar/a_w at nodes for stability
+    for i in range(Nx + 1):
+        Wstar[i], a_w[i] = surface_Wstar(Ts[i], X[i], gab, P_pa)
+
+    for i in range(Nx):
+        dTdx, dWdx = gas_rhs_x(Tg[i], Wg[i], Ts[i], Wstar[i], G, a_s, h, kg, Hads, P_pa)
+        Wg[i+1] = Wg[i] + dx * dWdx
+        Tg[i+1] = Tg[i] + dx * dTdx
+    return Tg, Wg, Wstar, a_w
+
+def solid_update_over_dt(Ts: np.ndarray, X: np.ndarray, Tg: np.ndarray, Wg: np.ndarray,
+                         geom: Geometry, sorb: SorbentProps, air: AirProps, gab: GABParams,
+                         h: float, kg: float, dt: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Explicit Euler update of solid over dt using current gas fields. Returns new (Ts, X).
+    """
+    N = Ts.size
+    Ts_new = Ts.copy()
+    X_new  = X.copy()
+    rho_eff = sorb.rho_s * (1.0 - geom.eps)
+    h_kJ = h / 1000.0
+    for i in range(N):
+        # local surface equilibrium
+        Wstar_i, _ = surface_Wstar(Ts[i], X[i], gab, air.P)
+        dXdt  = (geom.a_s * kg) * (Wg[i] - Wstar_i) / max(1e-12, rho_eff)
+        dTsdt = (geom.a_s * h_kJ) * (Tg[i] - Ts[i]) / max(1e-12, rho_eff * sorb.cp_s) \
+                + (-sorb.H_ads) * dXdt / max(1e-12, sorb.cp_s)
+        X_new[i]  = max(0.0, min(gab.Xm, X[i] + dt * dXdt))
+        Ts_new[i] = Ts[i] + dt * dTsdt
+    return Ts_new, X_new
+
+def zone_metrics(T_in: float, W_in: float, T_out: float, W_out: float,
+                 mdot_dry: float, air: AirProps,
+                 Ts_new: np.ndarray, X_new: np.ndarray,
+                 a_w: np.ndarray, Wstar: np.ndarray) -> Dict[str, float]:
+    RH_out = RH_from_T_W(T_out, W_out, air.P)
+    h_in   = h_kJkg(T_in,  W_in)
+    h_out  = h_kJkg(T_out, W_out)
+    dehum_kgps = mdot_dry * max(0.0, (W_in - W_out))
+    return {
+        "T_in_C": T_in, "W_in": W_in, "T_out_C": T_out, "W_out": W_out,
+        "RH_out": RH_out, "h_in_kJpkg": h_in, "h_out_kJpkg": h_out,
+        "dH_air_kW": mdot_dry * (h_out - h_in),
+        "dehumid_kgps": dehum_kgps, "dehumid_kgph": dehum_kgps * 3600.0,
+        "X_mean": float(np.mean(X_new)), "X_max": float(np.max(X_new)), "X_min": float(np.min(X_new)),
+        "aw_mean": float(np.mean(a_w)), "aw_max": float(np.max(a_w)),
+        "Wstar_out": float(Wstar[-1]),
+    }
+
+# -----------------------------
+# PUBLIC: Adsorption / Regeneration passes
+# -----------------------------
+
+def adsorption_pass(state: ZoneState, inp: ZoneInputs) -> ZoneOutputs:
+    """
+    ONE adsorption (dehumidification) pass:
+      - March gas along x with current solid (Ts, X) to get outlet (T_out, W_out)
+      - Update solid over dt_s (tends to X↑, Ts↑)
+    """
+    # Mass flux per face area
+    G = inp.mdot_dry_kgps / max(1e-12, inp.face_area_m2)
+
+    # Gas march using present solid fields
+    Tg, Wg, Wstar, a_w = gas_march_along_x(inp.T_in_C, inp.W_in, state.Ts_C, state.X,
+                                           G, inp.geom.a_s, inp.h_Wm2K, inp.kg_mps,
+                                           inp.sorb.H_ads, inp.air.P, inp.gab, inp.dx_m)
+    T_out = float(Tg[-1]); W_out = float(Wg[-1])
+
+    # Solid update over dwell time
+    Ts_new, X_new = solid_update_over_dt(state.Ts_C, state.X, Tg, Wg,
+                                         inp.geom, inp.sorb, inp.air, inp.gab,
+                                         inp.h_Wm2K, inp.kg_mps, inp.dt_s)
+
+    met = zone_metrics(inp.T_in_C, inp.W_in, T_out, W_out, inp.mdot_dry_kgps, inp.air,
+                       Ts_new, X_new, a_w, Wstar)
+
+    return ZoneOutputs(T_out_C=T_out, W_out=W_out,
+                       Ts_C_new=Ts_new, X_new=X_new,
+                       Tg_C=Tg, Wg=Wg, Wstar=Wstar, a_w=a_w, metrics=met)
+
+def regeneration_pass(state: ZoneState, inp: ZoneInputs) -> ZoneOutputs:
+    """
+    ONE regeneration (desorption) pass:
+      - Same numerics as adsorption; the sign of (W* - W_g) yields desorption (X tends to ↓).
+      - Inlet air is typically hot & dry (Tr_in, Wr_in) with its own flow mdot_r.
+    """
+    G = inp.mdot_dry_kgps / max(1e-12, inp.face_area_m2)
+
+    Tg, Wg, Wstar, a_w = gas_march_along_x(inp.T_in_C, inp.W_in, state.Ts_C, state.X,
+                                           G, inp.geom.a_s, inp.h_Wm2K, inp.kg_mps,
+                                           inp.sorb.H_ads, inp.air.P, inp.gab, inp.dx_m)
+    T_out = float(Tg[-1]); W_out = float(Wg[-1])
+
+    Ts_new, X_new = solid_update_over_dt(state.Ts_C, state.X, Tg, Wg,
+                                         inp.geom, inp.sorb, inp.air, inp.gab,
+                                         inp.h_Wm2K, inp.kg_mps, inp.dt_s)
+
+    met = zone_metrics(inp.T_in_C, inp.W_in, T_out, W_out, inp.mdot_dry_kgps, inp.air,
+                       Ts_new, X_new, a_w, Wstar)
+
+    return ZoneOutputs(T_out_C=T_out, W_out=W_out,
+                       Ts_C_new=Ts_new, X_new=X_new,
+                       Tg_C=Tg, Wg=Wg, Wstar=Wstar, a_w=a_w, metrics=met)
